@@ -1,0 +1,302 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  db:
+    image: postgres:15-alpine
+    container_name: rufus_db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rufus}
+      POSTGRES_USER: ${POSTGRES_USER:-rufus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rufus_password}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    networks:
+      - rufus-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rufus}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for Celery and Caching
+  redis:
+    image: redis:7-alpine
+    container_name: rufus_redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - rufus-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ROS2 Core - Navigation, SLAM, Core Services
+  ros2-core:
+    build:
+      context: ./docker/ros2_core
+      dockerfile: Dockerfile
+    image: rufus/ros2-core:latest
+    container_name: rufus_ros2_core
+    runtime: nvidia
+    network_mode: host
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-42}
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    volumes:
+      - ./ros2_ws:/workspace/ros2_ws
+      - ./config:/config
+      - rufus_logs:/var/log/rufus
+      - rufus_maps:/maps
+    deploy:
+      resources:
+        limits:
+          cpus: '2.5'
+          memory: 4G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    command: ros2 launch rufus_bringup bringup.launch.py
+
+  # Hardware Drivers - Chassis and Arm Control
+  drivers:
+    build:
+      context: ./docker/drivers
+      dockerfile: Dockerfile
+    image: rufus/drivers:latest
+    container_name: rufus_drivers
+    runtime: nvidia
+    network_mode: host
+    privileged: true
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-42}
+      - CHASSIS_PORT=${CHASSIS_PORT:-/dev/ttyUSB0}
+      - ARM_PORT=${ARM_PORT:-/dev/ttyUSB1}
+    devices:
+      - /dev/ttyUSB0:/dev/ttyUSB0  # Chassis RS485
+      - /dev/ttyUSB1:/dev/ttyUSB1  # Arm RS485
+    volumes:
+      - ./ros2_ws/src/rufus_drivers:/workspace/ros2_ws/src/rufus_drivers
+      - ./config/drivers:/config
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+    restart: unless-stopped
+    depends_on:
+      - ros2-core
+    command: ros2 launch rufus_drivers drivers.launch.py
+
+  # Perception - Vision, Lidar, Object Detection
+  perception:
+    build:
+      context: ./docker/perception
+      dockerfile: Dockerfile
+    image: rufus/perception:latest
+    container_name: rufus_perception
+    runtime: nvidia
+    network_mode: host
+    privileged: true
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-42}
+      - NVIDIA_VISIBLE_DEVICES=0
+    devices:
+      - /dev/video0:/dev/video0  # Camera
+    volumes:
+      - ./ros2_ws/src/rufus_perception:/workspace/ros2_ws/src/rufus_perception
+      - ./config/perception:/config
+      - ./models:/models
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    depends_on:
+      - ros2-core
+    command: ros2 launch rufus_perception perception.launch.py
+
+  # Manipulation - Arm Motion Planning with MoveIt2
+  manipulation:
+    build:
+      context: ./docker/manipulation
+      dockerfile: Dockerfile
+    image: rufus/manipulation:latest
+    container_name: rufus_manipulation
+    runtime: nvidia
+    network_mode: host
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-42}
+    volumes:
+      - ./ros2_ws/src/rufus_manipulation:/workspace/ros2_ws/src/rufus_manipulation
+      - ./config/moveit:/config/moveit
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 3G
+    restart: unless-stopped
+    depends_on:
+      - ros2-core
+      - drivers
+    command: ros2 launch rufus_manipulation manipulation.launch.py
+
+  # ROSBridge - WebSocket Bridge to ROS2
+  rosbridge:
+    image: dustynv/ros:humble-ros-base-l4t-r36.2.0
+    container_name: rufus_rosbridge
+    runtime: nvidia
+    network_mode: host
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-42}
+    command: ros2 launch rosbridge_server rosbridge_websocket_launch.xml port:=9090
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    restart: unless-stopped
+    depends_on:
+      - ros2-core
+
+  # Django Web Backend with Channels
+  web-backend:
+    build:
+      context: ./docker/web_backend
+      dockerfile: Dockerfile
+    image: rufus/web-backend:latest
+    container_name: rufus_web_backend
+    command: daphne -b 0.0.0.0 -p 8000 rufus_web.asgi:application
+    volumes:
+      - ./django_app:/app
+      - static-volume:/app/staticfiles
+      - media-volume:/app/media
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-rufus}:${POSTGRES_PASSWORD:-rufus_password}@db:5432/${POSTGRES_DB:-rufus}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - ROSBRIDGE_HOST=${ROSBRIDGE_HOST:-localhost}
+      - ROSBRIDGE_PORT=${ROSBRIDGE_PORT:-9090}
+      - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY:-change-me-in-production}
+      - DJANGO_DEBUG=${DJANGO_DEBUG:-False}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-*}
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rosbridge:
+        condition: service_started
+    networks:
+      - rufus-network
+    restart: unless-stopped
+
+  # Celery Worker for Background Tasks
+  celery-worker:
+    build:
+      context: ./docker/web_backend
+      dockerfile: Dockerfile
+    image: rufus/web-backend:latest
+    container_name: rufus_celery_worker
+    command: celery -A rufus_web worker --loglevel=info
+    volumes:
+      - ./django_app:/app
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-rufus}:${POSTGRES_PASSWORD:-rufus_password}@db:5432/${POSTGRES_DB:-rufus}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - rufus-network
+    restart: unless-stopped
+
+  # Celery Beat for Scheduled Tasks
+  celery-beat:
+    build:
+      context: ./docker/web_backend
+      dockerfile: Dockerfile
+    image: rufus/web-backend:latest
+    container_name: rufus_celery_beat
+    command: celery -A rufus_web beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    volumes:
+      - ./django_app:/app
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-rufus}:${POSTGRES_PASSWORD:-rufus_password}@db:5432/${POSTGRES_DB:-rufus}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - rufus-network
+    restart: unless-stopped
+
+  # React Frontend
+  web-frontend:
+    build:
+      context: ./docker/web_frontend
+      dockerfile: Dockerfile
+    image: rufus/web-frontend:latest
+    container_name: rufus_web_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_URL=${VITE_API_URL:-http://localhost:8000}
+      - VITE_WS_URL=${VITE_WS_URL:-ws://localhost:8000/ws}
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    networks:
+      - rufus-network
+    restart: unless-stopped
+    depends_on:
+      - web-backend
+
+volumes:
+  db-data:
+    driver: local
+  redis-data:
+    driver: local
+  rufus_logs:
+    driver: local
+  rufus_maps:
+    driver: local
+  static-volume:
+    driver: local
+  media-volume:
+    driver: local
+
+networks:
+  rufus-network:
+    driver: bridge
+
